@@ -15,15 +15,22 @@ Usage:
         --batch_size 32 \
         --save_dir /path/to/output
 
+    # Export trained weights to ONNX
+    python gnn.py export_onnx \
+        --weights /path/to/output/gnn_weights_best.pt \
+        --onnx_out /path/to/output/gnn_weights_best.onnx
+
 """
 
 import argparse
 import copy
+import json
 import math
 import os
 import random
 import sqlite3
 import sys
+from itertools import product
 
 import matplotlib
 matplotlib.use("Agg")
@@ -76,10 +83,9 @@ def event_stream(db_file):
 
     query = """
         SELECT p.event_no, p.dom_x, p.dom_y, p.dom_z, p.dom_time, p.charge,
-               t.energy
+            t.energy
         FROM   CleanedROIPulses p
         JOIN   truth            t ON p.event_no = t.event_no
-        WHERE  t.energy > 5e4
         ORDER  BY p.event_no
     """
 
@@ -218,7 +224,7 @@ def event_to_string_graph(rows, geo_dict, meta=None,
         z_rel      = (z_centroid - z_q_center) / xyz_scale
         t_first    = float(t_s.min()) / t_scale
         q_frac     = q_sum_s / q_total
-
+        
         node_feats.append([
             str_x,                  # 0
             str_y,                  # 1
@@ -334,7 +340,8 @@ def collate_hit_sequences(batch):
     return {"x": x, "padding_mask": mask, "y": y}
 
 class SuperGNN(nn.Module):
-    def __init__(self, hidden_dim=128, input_dim=N_FEATURES):
+
+    def __init__(self, hidden_dim=256, input_dim=N_FEATURES, dropout=0.4, num_layers=7):
         super().__init__()
 
         self.node_mlp = nn.Sequential(
@@ -343,40 +350,42 @@ class SuperGNN(nn.Module):
             nn.BatchNorm1d(hidden_dim),
         )
 
-        self.conv1 = TransformerConv(hidden_dim,     hidden_dim, heads=4)
-        self.conv2 = TransformerConv(hidden_dim * 4, hidden_dim, heads=4)
-        self.conv3 = TransformerConv(hidden_dim * 4, hidden_dim, heads=4)
-        self.conv4 = TransformerConv(hidden_dim * 4, hidden_dim, heads=4)
-        self.conv5 = TransformerConv(hidden_dim * 4, hidden_dim, heads=4)
-
-        self.bn1 = nn.BatchNorm1d(hidden_dim * 4)
-        self.bn2 = nn.BatchNorm1d(hidden_dim * 4)
-        self.bn3 = nn.BatchNorm1d(hidden_dim * 4)
-        self.bn4 = nn.BatchNorm1d(hidden_dim * 4)
-        self.bn5 = nn.BatchNorm1d(hidden_dim * 4)
+        self.num_layers = num_layers
+        self.convs = nn.ModuleList()
+        self.bns = nn.ModuleList()
+        for i in range(num_layers):
+            in_dim = hidden_dim if i == 0 else hidden_dim * 4
+            self.convs.append(TransformerConv(in_dim, hidden_dim, heads=4))
+            self.bns.append(nn.BatchNorm1d(hidden_dim * 4))
         self.act = nn.ReLU()
-        self.drop = nn.Dropout(0.4)
+        self.drop = nn.Dropout(dropout)
 
         # +1 for appended mean_q
         self.classifier = nn.Sequential(
             nn.Linear(hidden_dim * 4 + 1, 64),
             nn.ReLU(),
-            nn.Dropout(0.4),
+            nn.Dropout(dropout),
             nn.Linear(64, 1),
         )
 
-    def forward(self, data):
-        x, edge_index, batch = data.x, data.edge_index, data.batch
+    def forward(self, data, edge_index=None, batch=None):
+        if isinstance(data, Data):
+            x = data.x
+            edge_index = data.edge_index
+            batch = data.batch
+        else:
+            x = data
+            if edge_index is None or batch is None:
+                raise ValueError("edge_index and batch are required when Data is not provided")
+
+        raw_x = x
 
         x = self.node_mlp(x)
-        x = self.drop(self.act(self.bn1(self.conv1(x, edge_index))))
-        x = self.drop(self.act(self.bn2(self.conv2(x, edge_index))))
-        x = self.drop(self.act(self.bn3(self.conv3(x, edge_index))))
-        x = self.drop(self.act(self.bn4(self.conv4(x, edge_index))))
-        x = self.drop(self.act(self.bn5(self.conv5(x, edge_index))))
-        
-        x      = global_mean_pool(x, batch)
-        mean_q = global_mean_pool(data.x[:, 6], batch).unsqueeze(1)  # feat 6 = q_log
+        for conv, bn in zip(self.convs, self.bns):
+            x = self.drop(self.act(bn(conv(x, edge_index))))
+
+        x = global_mean_pool(x, batch)
+        mean_q = global_mean_pool(raw_x[:, 6:7], batch)  # feat 6 = q_log
 
         return self.classifier(torch.cat([x, mean_q], dim=1)).squeeze(1)
 
@@ -443,12 +452,111 @@ def load_checkpoint(checkpoint_path, model, optimizer, scheduler, device):
     print(f"Resumed from checkpoint: epoch {start_epoch}, best AUC: {best_val_auc:.4f} @ epoch {best_epoch}")
     return start_epoch, best_val_auc, best_epoch, train_losses, val_losses, val_aucs, lr_history
 
-def train(args):
+def load_model_weights(weights_path, model, device):
+    """Load either a raw state_dict .pt file or a training checkpoint."""
+    if not os.path.exists(weights_path):
+        raise FileNotFoundError(f"Weights file not found: {weights_path}")
+
+    payload = torch.load(weights_path, map_location=device)
+    if isinstance(payload, dict) and "model_state_dict" in payload:
+        state_dict = payload["model_state_dict"]
+    elif isinstance(payload, dict):
+        state_dict = payload
+    else:
+        raise RuntimeError(f"Unsupported weight file format: {weights_path}")
+
+    model.load_state_dict(state_dict)
+    return payload
+
+def build_export_graph(num_nodes, device):
+    if num_nodes < 2:
+        raise ValueError("--num_nodes must be at least 2 for ONNX export")
+
+    x = torch.zeros((num_nodes, N_FEATURES), dtype=torch.float32, device=device)
+    src = torch.arange(num_nodes - 1, dtype=torch.long, device=device)
+    dst = src + 1
+    edge_index = torch.stack([
+        torch.cat([src, dst]),
+        torch.cat([dst, src]),
+    ], dim=0)
+    batch = torch.zeros(num_nodes, dtype=torch.long, device=device)
+    return x, edge_index, batch
+
+def export_onnx(args):
+    device = torch.device("cpu")
+    # Try to load config from checkpoint if available
+    config = None
+    if args.weights.endswith(".pt"):
+        checkpoint = torch.load(args.weights, map_location=device)
+        if isinstance(checkpoint, dict) and "config" in checkpoint:
+            config = checkpoint["config"]
+    # Priority: explicit args > config > defaults
+    hidden_dim = getattr(args, "hidden_dim", None)
+    if hidden_dim is None and config and "hidden_dim" in config:
+        hidden_dim = config["hidden_dim"]
+    if hidden_dim is None:
+        hidden_dim = 256
+
+    num_layers = getattr(args, "num_layers", None)
+    if num_layers is None and config and "num_layers" in config:
+        num_layers = config["num_layers"]
+    if num_layers is None:
+        num_layers = 7
+
+    dropout = getattr(args, "dropout", None)
+    if dropout is None and config and "dropout" in config:
+        dropout = config["dropout"]
+    if dropout is None:
+        dropout = 0.4
+
+    model = SuperGNN(
+        input_dim=N_FEATURES,
+        hidden_dim=hidden_dim,
+        dropout=dropout,
+        num_layers=num_layers
+    ).to(device)
+    load_model_weights(args.weights, model, device)
+    model.eval()
+
+    x, edge_index, batch = build_export_graph(args.num_nodes, device)
+
+    onnx_out = args.onnx_out
+    if onnx_out is None:
+        root, _ = os.path.splitext(args.weights)
+        onnx_out = root + ".onnx"
+
+    out_dir = os.path.dirname(onnx_out)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    torch.onnx.export(
+        model,
+        (x, edge_index, batch),
+        onnx_out,
+        export_params=True,
+        opset_version=args.opset,
+        do_constant_folding=True,
+        input_names=["x", "edge_index", "batch"],
+        output_names=["logits"],
+        dynamic_axes={
+            "x": {0: "num_nodes"},
+            "edge_index": {1: "num_edges"},
+            "batch": {0: "num_nodes"},
+            "logits": {0: "num_graphs"},
+        },
+    )
+    print(f"Saved ONNX model -> {onnx_out}")
+
+def prepare_training_data(args):
     set_seed(42)
 
     if not os.path.exists(args.geo):
         print(f"ERROR: geometry file not found: {args.geo}", file=sys.stderr)
         sys.exit(1)
+
+    holdout_frac = args.val_frac + args.test_frac
+    if holdout_frac <= 0.0 or holdout_frac >= 1.0:
+        raise ValueError("val_frac + test_frac must be between 0 and 1")
 
     geo      = pd.read_csv(args.geo)
     geo_dict = icecube_geom(geo)
@@ -465,7 +573,6 @@ def train(args):
     indices = np.arange(len(dataset))
     labels  = np.array([dataset[i].y.item() for i in range(len(dataset))])
 
-    holdout_frac = args.val_frac + args.test_frac
     train_idx, holdout_idx = train_test_split(
         indices, test_size=holdout_frac, stratify=labels, random_state=42
     )
@@ -481,80 +588,186 @@ def train(args):
     test_ds  = dataset[test_idx.tolist()]
     print(f"Split -> train: {len(train_ds)}  val: {len(val_ds)}  test: {len(test_ds)}")
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size,
-                              shuffle=True, num_workers=4, pin_memory=True)
-    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, num_workers=4)
-    test_loader  = DataLoader(test_ds,  batch_size=args.batch_size, num_workers=4)
+    return {
+        "train_ds": train_ds,
+        "val_ds": val_ds,
+        "test_ds": test_ds,
+        "train_idx": train_idx,
+        "val_idx": val_idx,
+        "test_idx": test_idx,
+        "train_labels": labels[train_idx],
+    }
+
+
+def create_dataloaders(data_bundle, batch_size):
+    num_workers = min(4, os.cpu_count() or 1)
+    pin_memory = torch.cuda.is_available()
+
+    train_loader = DataLoader(
+        data_bundle["train_ds"],
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+    val_loader = DataLoader(
+        data_bundle["val_ds"],
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+    test_loader = DataLoader(
+        data_bundle["test_ds"],
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+    return train_loader, val_loader, test_loader
+
+
+def save_training_plots(save_dir, train_losses, val_losses, val_aucs,
+                        lr_history, best_val_auc, best_epoch,
+                        test_auc, test_preds, test_trues):
+    fig, axes = plt.subplots(1, 4, figsize=(20, 4), facecolor="black")
+    fig.patch.set_facecolor("black")
+
+    def style(ax, title, xlabel, ylabel):
+        ax.set_facecolor("black")
+        ax.tick_params(colors="white")
+        for spine in ["bottom", "left"]:
+            ax.spines[spine].set_color("gray")
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.set_title(title, color="white")
+        ax.set_xlabel(xlabel, color="white")
+        ax.set_ylabel(ylabel, color="white")
+
+    axes[0].plot(train_losses, color="cyan", label="Train")
+    axes[0].plot(val_losses, color="orange", label="Val")
+    axes[0].legend(facecolor="black", labelcolor="white", edgecolor="gray")
+    style(axes[0], "Loss", "Epoch", "BCE Loss")
+
+    axes[1].plot(val_aucs, color="lime")
+    axes[1].axhline(best_val_auc, color="white", lw=0.8, linestyle="--",
+                    label=f"best={best_val_auc:.4f} @ ep{best_epoch}")
+    axes[1].legend(facecolor="black", labelcolor="white", edgecolor="gray")
+    style(axes[1], "Val AUC", "Epoch", "AUC")
+
+    axes[2].plot(lr_history, color="yellow")
+    axes[2].axvline(4, color="gray", lw=0.8, linestyle="--", label="warmup end")
+    axes[2].legend(facecolor="black", labelcolor="white", edgecolor="gray")
+    axes[2].set_yscale("log")
+    style(axes[2], "Learning Rate", "Epoch", "LR (log scale)")
+
+    fpr, tpr, _ = roc_curve(test_trues, test_preds)
+    axes[3].plot(fpr, tpr, color="cyan", lw=2, label=f"AUC={test_auc:.3f}")
+    axes[3].plot([0, 1], [0, 1], color="gray", lw=1, linestyle="--")
+    axes[3].legend(facecolor="black", labelcolor="white", edgecolor="gray")
+    style(axes[3], "ROC -- Test Set", "FPR", "TPR")
+
+    plt.tight_layout()
+    plot_path = os.path.join(save_dir, "training_curves.png")
+    plt.savefig(plot_path, dpi=150, bbox_inches="tight", facecolor="black")
+    plt.close()
+    print(f"Saved curves     -> {plot_path}")
+
+
+def run_training_job(args, data_bundle, save_dir, hidden_dim, num_layers,
+                     dropout, epochs, patience, resume_from=None,
+                     export_best_onnx=True, create_plots=True,
+                     save_epoch_checkpoints=True, seed=42,
+                     run_label=None):
+    set_seed(seed)
+    os.makedirs(save_dir, exist_ok=True)
+
+    train_loader, val_loader, test_loader = create_dataloaders(
+        data_bundle, args.batch_size
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    label_prefix = f"[{run_label}] " if run_label else ""
+    print(f"{label_prefix}Device: {device}")
 
-    model     = SuperGNN(input_dim=N_FEATURES).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-3)
+    model = SuperGNN(
+        input_dim=N_FEATURES,
+        hidden_dim=hidden_dim,
+        dropout=dropout,
+        num_layers=num_layers,
+    ).to(device)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
 
     scheduler = loss_schedule(
         optimizer,
-        warmup_epochs   = 5,
-        total_epochs    = args.epochs,
-        steps_per_epoch = len(train_loader),
+        warmup_epochs=5,
+        total_epochs=epochs,
+        steps_per_epoch=len(train_loader),
     )
 
-    n_pos      = max(int((labels[train_idx] == 1).sum()), 1)
-    n_neg      = max(int((labels[train_idx] == 0).sum()), 1)
+    train_labels = data_bundle["train_labels"]
+    n_pos = max(int((train_labels == 1).sum()), 1)
+    n_neg = max(int((train_labels == 0).sum()), 1)
     pos_weight = torch.tensor([n_neg / n_pos], device=device, dtype=torch.float32)
-    criterion  = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-    print(f"Class balance   -- tau: {n_pos}  nue: {n_neg}  pos_weight: {n_neg/n_pos:.3f}")
-    print(f"LR schedule     -- warmup: 5 epochs, cosine decay over {args.epochs} epochs")
-    print(f"Peak LR         -- {args.lr:.2e}")
+    print(f"{label_prefix}Class balance   -- tau: {n_pos}  nue: {n_neg}  pos_weight: {n_neg / n_pos:.3f}")
+    print(f"{label_prefix}LR schedule     -- warmup: 5 epochs, cosine decay over {epochs} epochs")
+    print(f"{label_prefix}Peak LR         -- {args.lr:.2e}")
 
-    best_val_auc   = -np.inf
-    best_val_loss  = np.inf
-    best_state     = None
-    best_epoch     = -1
-    patience       = getattr(args, "patience", 15)
+    best_val_auc = -np.inf
+    best_val_loss = np.inf
+    best_state = None
+    best_epoch = -1
     epochs_no_gain = 0
-    os.makedirs(args.save_dir, exist_ok=True)
 
     train_losses = []
-    val_losses   = []
-    val_aucs     = []
-    lr_history   = []   # one value per epoch (end-of-epoch LR)
+    val_losses = []
+    val_aucs = []
+    lr_history = []
 
-    weights_path    = os.path.join(args.save_dir, "gnn_weights.pt")
-    best_path       = os.path.join(args.save_dir, "gnn_weights_best.pt")
-    checkpoint_path = os.path.join(args.save_dir, "gnn_checkpoint.pt")
+    weights_path = os.path.join(save_dir, "gnn_weights.pt")
+    best_path = os.path.join(save_dir, "gnn_weights_best.pt")
+    checkpoint_path = os.path.join(save_dir, "gnn_checkpoint.pt")
 
-    # Load from checkpoint if resuming
     start_epoch = 0
-    if hasattr(args, "resume_from") and args.resume_from:
+    if resume_from:
         start_epoch, best_val_auc, best_epoch, train_losses, val_losses, val_aucs, lr_history = load_checkpoint(
-            args.resume_from, model, optimizer, scheduler, device
+            resume_from, model, optimizer, scheduler, device
         )
         if len(val_losses) > 0:
             best_val_loss = float(np.min(val_losses))
-        epochs_no_gain = start_epoch - best_epoch
+        epochs_no_gain = max(0, start_epoch - best_epoch)
 
-    epoch_pbar = tqdm(range(start_epoch, args.epochs), desc="Epochs", unit="epoch", position=0)
+    epoch_desc = f"Epochs {run_label}" if run_label else "Epochs"
+    epoch_pbar = tqdm(range(start_epoch, epochs), desc=epoch_desc, unit="epoch", position=0)
     for epoch in epoch_pbar:
         model.train()
         total_loss = 0.0
 
+        batch_desc = f"  Train {epoch + 1:03d}"
+        if run_label:
+            batch_desc = f"  {run_label} {epoch + 1:03d}"
         batch_pbar = tqdm(
             train_loader,
-            desc=f"  Train {epoch+1:03d}",
-            unit="batch", position=1, leave=False
+            desc=batch_desc,
+            unit="batch",
+            position=1,
+            leave=False,
         )
         for batch in batch_pbar:
-            batch   = batch.to(device)
+            batch = batch.to(device)
             optimizer.zero_grad()
-            logits  = model(batch)
+            logits = model(batch)
             targets = batch.y.view(-1)
-            loss    = criterion(logits, targets)
+            loss = criterion(logits, targets)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            scheduler.step()   # step per batch
+            scheduler.step()
             total_loss += loss.item() * batch.num_graphs
             batch_pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
@@ -571,9 +784,9 @@ def train(args):
         loss_improved = val_loss < best_val_loss
 
         if auc_improved:
-            best_val_auc   = val_auc
-            best_state     = copy.deepcopy(model.state_dict())
-            best_epoch     = epoch + 1
+            best_val_auc = val_auc
+            best_state = copy.deepcopy(model.state_dict())
+            best_epoch = epoch + 1
             torch.save(best_state, best_path)
 
         if loss_improved:
@@ -586,13 +799,13 @@ def train(args):
 
         val_auc_str = f"{val_auc:.4f}" if not np.isnan(val_auc) else "nan"
         epoch_pbar.set_postfix({
-            "train":    f"{train_loss:.4f}",
-            "val_AUC":  val_auc_str,
-            "best_AUC": f"{best_val_auc:.4f}",
-            "lr":       f"{current_lr:.2e}",
+            "train": f"{train_loss:.4f}",
+            "val_AUC": val_auc_str,
+            "best_AUC": f"{best_val_auc:.4f}" if np.isfinite(best_val_auc) else "-inf",
+            "lr": f"{current_lr:.2e}",
         })
         tqdm.write(
-            f"Epoch {epoch+1:03d}/{args.epochs} | "
+            f"{label_prefix}Epoch {epoch + 1:03d}/{epochs} | "
             f"Train: {train_loss:.4f} | "
             f"Val: {val_loss:.4f} | "
             f"AUC: {val_auc_str} | "
@@ -600,108 +813,252 @@ def train(args):
             f"LR: {current_lr:.2e}"
         )
 
-        # Save per-epoch checkpoint for resume capability
+        run_config = dict(vars(args))
+        run_config.update({
+            "hidden_dim": hidden_dim,
+            "num_layers": num_layers,
+            "dropout": dropout,
+            "epochs": epochs,
+            "patience": patience,
+        })
+
         epoch_checkpoint = {
-            "epoch":                epoch + 1,
-            "model_state_dict":     model.state_dict(),
+            "epoch": epoch + 1,
+            "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
-            "best_val_auc":         float(best_val_auc),
-            "best_epoch":           best_epoch,
-            "train_losses":         train_losses,
-            "val_losses":           val_losses,
-            "val_aucs":             val_aucs,
-            "lr_history":           lr_history,
-            "train_idx":            train_idx,
-            "val_idx":              val_idx,
-            "test_idx":             test_idx,
-            "config":               vars(args),
+            "best_val_auc": float(best_val_auc),
+            "best_epoch": best_epoch,
+            "train_losses": train_losses,
+            "val_losses": val_losses,
+            "val_aucs": val_aucs,
+            "lr_history": lr_history,
+            "train_idx": data_bundle["train_idx"],
+            "val_idx": data_bundle["val_idx"],
+            "test_idx": data_bundle["test_idx"],
+            "config": run_config,
         }
-        epoch_ckpt_path = os.path.join(args.save_dir, f"gnn_checkpoint_epoch_{epoch+1:03d}.pt")
-        latest_ckpt_path = os.path.join(args.save_dir, "gnn_checkpoint_latest.pt")
-        torch.save(epoch_checkpoint, epoch_ckpt_path)
-        torch.save(epoch_checkpoint, latest_ckpt_path)
+        if save_epoch_checkpoints:
+            epoch_ckpt_path = os.path.join(save_dir, f"gnn_checkpoint_epoch_{epoch + 1:03d}.pt")
+            latest_ckpt_path = os.path.join(save_dir, "gnn_checkpoint_latest.pt")
+            torch.save(epoch_checkpoint, epoch_ckpt_path)
+            torch.save(epoch_checkpoint, latest_ckpt_path)
 
         if epochs_no_gain >= patience:
-            tqdm.write(f"Early stopping at epoch {epoch+1} (no val AUC or val loss improvement for {patience} epochs)")
+            tqdm.write(
+                f"{label_prefix}Early stopping at epoch {epoch + 1} "
+                f"(no val AUC or val loss improvement for {patience} epochs)"
+            )
             break
 
-    if best_state is not None:
-        model.load_state_dict(best_state)
-        print(f"\nRestored best weights from epoch {best_epoch} (AUC={best_val_auc:.4f})")
+    if best_state is None:
+        best_state = copy.deepcopy(model.state_dict())
+        best_epoch = max(start_epoch, len(train_losses))
+        torch.save(best_state, best_path)
+
+    model.load_state_dict(best_state)
+    if np.isfinite(best_val_auc):
+        print(f"\n{label_prefix}Restored best weights from epoch {best_epoch} (AUC={best_val_auc:.4f})")
+    else:
+        print(f"\n{label_prefix}Restored final weights (validation AUC unavailable)")
 
     torch.save(model.state_dict(), weights_path)
+    run_config = dict(vars(args))
+    run_config.update({
+        "hidden_dim": hidden_dim,
+        "num_layers": num_layers,
+        "dropout": dropout,
+        "epochs": epochs,
+        "patience": patience,
+    })
     checkpoint = {
-        "epoch":                best_epoch,
-        "model_state_dict":     model.state_dict(),
+        "epoch": best_epoch,
+        "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
-        "best_val_auc":         float(best_val_auc),
-        "train_idx":            train_idx,
-        "val_idx":              val_idx,
-        "test_idx":             test_idx,
-        "train_losses":         train_losses,
-        "val_losses":           val_losses,
-        "val_aucs":             val_aucs,
-        "lr_history":           lr_history,
-        "config":               vars(args),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "best_val_auc": float(best_val_auc),
+        "best_epoch": best_epoch,
+        "train_idx": data_bundle["train_idx"],
+        "val_idx": data_bundle["val_idx"],
+        "test_idx": data_bundle["test_idx"],
+        "train_losses": train_losses,
+        "val_losses": val_losses,
+        "val_aucs": val_aucs,
+        "lr_history": lr_history,
+        "config": run_config,
     }
     torch.save(checkpoint, checkpoint_path)
-    print(f"Saved weights    -> {weights_path}")
-    print(f"Saved best       -> {best_path}")
-    print(f"Saved checkpoint -> {checkpoint_path}")
+    print(f"{label_prefix}Saved weights    -> {weights_path}")
+    print(f"{label_prefix}Saved best       -> {best_path}")
+    print(f"{label_prefix}Saved checkpoint -> {checkpoint_path}")
 
     test_loss, test_auc, test_preds, test_trues = evaluator(
         model, test_loader, criterion, device
     )
-    print(f"Test Loss: {test_loss:.4f} | Test AUC: {test_auc:.4f}")
+    print(f"{label_prefix}Test Loss: {test_loss:.4f} | Test AUC: {test_auc:.4f}")
 
-    # ---- Training curves (4 panels) ----
-    fig, axes = plt.subplots(1, 4, figsize=(20, 4), facecolor="black")
-    fig.patch.set_facecolor("black")
+    if create_plots:
+        save_training_plots(
+            save_dir,
+            train_losses,
+            val_losses,
+            val_aucs,
+            lr_history,
+            best_val_auc,
+            best_epoch,
+            test_auc,
+            test_preds,
+            test_trues,
+        )
 
-    def style(ax, title, xlabel, ylabel):
-        ax.set_facecolor("black")
-        ax.tick_params(colors="white")
-        for spine in ["bottom", "left"]:
-            ax.spines[spine].set_color("gray")
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-        ax.set_title(title, color="white")
-        ax.set_xlabel(xlabel, color="white")
-        ax.set_ylabel(ylabel, color="white")
+    if export_best_onnx:
+        class DummyArgs:
+            pass
 
-    # Loss curves
-    axes[0].plot(train_losses, color="cyan",   label="Train")
-    axes[0].plot(val_losses,   color="orange", label="Val")
-    axes[0].legend(facecolor="black", labelcolor="white", edgecolor="gray")
-    style(axes[0], "Loss", "Epoch", "BCE Loss")
+        onnx_args = DummyArgs()
+        onnx_args.weights = best_path
+        onnx_args.onnx_out = os.path.join(save_dir, "gnn_weights_best.onnx")
+        onnx_args.num_nodes = 16
+        onnx_args.opset = 17
+        print(f"{label_prefix}Exporting best model to ONNX: {onnx_args.onnx_out}")
+        export_onnx(onnx_args)
 
-    # Val AUC
-    axes[1].plot(val_aucs, color="lime")
-    axes[1].axhline(best_val_auc, color="white", lw=0.8, linestyle="--",
-                    label=f"best={best_val_auc:.4f} @ ep{best_epoch}")
-    axes[1].legend(facecolor="black", labelcolor="white", edgecolor="gray")
-    style(axes[1], "Val AUC", "Epoch", "AUC")
+    return {
+        "hidden_dim": hidden_dim,
+        "num_layers": num_layers,
+        "dropout": dropout,
+        "best_val_auc": float(best_val_auc),
+        "best_val_loss": float(best_val_loss),
+        "best_epoch": best_epoch,
+        "test_auc": float(test_auc),
+        "test_loss": float(test_loss),
+        "save_dir": save_dir,
+        "best_path": best_path,
+    }
 
-    # Learning rate (log scale, one point per epoch)
-    axes[2].plot(lr_history, color="yellow")
-    axes[2].axvline(4, color="gray", lw=0.8, linestyle="--", label="warmup end")
-    axes[2].legend(facecolor="black", labelcolor="white", edgecolor="gray")
-    axes[2].set_yscale("log")
-    style(axes[2], "Learning Rate", "Epoch", "LR (log scale)")
 
-    # ROC curve
-    fpr, tpr, _ = roc_curve(test_trues, test_preds)
-    axes[3].plot(fpr, tpr, color="cyan", lw=2, label=f"AUC={test_auc:.3f}")
-    axes[3].plot([0, 1], [0, 1], color="gray", lw=1, linestyle="--")
-    axes[3].legend(facecolor="black", labelcolor="white", edgecolor="gray")
-    style(axes[3], "ROC -- Test Set", "FPR", "TPR")
+def train(args):
+    data_bundle = prepare_training_data(args)
+    return run_training_job(
+        args,
+        data_bundle,
+        save_dir=args.save_dir,
+        hidden_dim=args.hidden_dim,
+        num_layers=args.num_layers,
+        dropout=args.dropout,
+        epochs=args.epochs,
+        patience=args.patience,
+        resume_from=args.resume_from,
+        export_best_onnx=True,
+        create_plots=True,
+        save_epoch_checkpoints=True,
+        seed=42,
+    )
 
-    plt.tight_layout()
-    plot_path = os.path.join(args.save_dir, "training_curves.png")
-    plt.savefig(plot_path, dpi=150, bbox_inches="tight", facecolor="black")
-    plt.close()
-    print(f"Saved curves     -> {plot_path}")
+
+def search_architectures(args):
+    data_bundle = prepare_training_data(args)
+
+    search_space = list(product(
+        args.search_hidden_dims,
+        args.search_num_layers,
+        args.search_dropouts,
+    ))
+    if not search_space:
+        raise ValueError("Search space is empty")
+
+    trials_root = os.path.join(args.save_dir, "search_trials")
+    os.makedirs(trials_root, exist_ok=True)
+
+    results = []
+    total_trials = len(search_space)
+    print(f"Running architecture search over {total_trials} candidate(s)")
+    for trial_idx, (hidden_dim, num_layers, dropout) in enumerate(search_space, start=1):
+        trial_name = (
+            f"trial_{trial_idx:02d}_h{hidden_dim}_l{num_layers}_d"
+            f"{str(dropout).replace('.', 'p')}"
+        )
+        trial_dir = os.path.join(trials_root, trial_name)
+        print(
+            f"\n=== Trial {trial_idx}/{total_trials} | "
+            f"hidden_dim={hidden_dim}, num_layers={num_layers}, dropout={dropout} ==="
+        )
+        trial_result = run_training_job(
+            args,
+            data_bundle,
+            save_dir=trial_dir,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            dropout=dropout,
+            epochs=args.search_epochs,
+            patience=args.search_patience,
+            resume_from=None,
+            export_best_onnx=False,
+            create_plots=False,
+            save_epoch_checkpoints=False,
+            seed=42 + trial_idx,
+            run_label=trial_name,
+        )
+        trial_result["trial_name"] = trial_name
+        results.append(trial_result)
+
+    results_df = pd.DataFrame(results).sort_values(
+        by=["best_val_auc", "best_val_loss"],
+        ascending=[False, True],
+    )
+    results_path = os.path.join(args.save_dir, "architecture_search_results.csv")
+    results_df.to_csv(results_path, index=False)
+    print(f"Saved search summary -> {results_path}")
+
+    best_row = results_df.iloc[0]
+    best_config = {
+        "hidden_dim": int(best_row["hidden_dim"]),
+        "num_layers": int(best_row["num_layers"]),
+        "dropout": float(best_row["dropout"]),
+        "search_epochs": int(args.search_epochs),
+        "search_patience": int(args.search_patience),
+        "best_val_auc": float(best_row["best_val_auc"]),
+        "best_val_loss": float(best_row["best_val_loss"]),
+        "trial_name": best_row["trial_name"],
+    }
+    best_config_path = os.path.join(args.save_dir, "best_search_config.json")
+    with open(best_config_path, "w", encoding="ascii") as handle:
+        json.dump(best_config, handle, indent=2)
+    print(f"Best search config  -> {best_config_path}")
+
+    print(
+        "\nRetraining best architecture with full schedule: "
+        f"hidden_dim={best_config['hidden_dim']}, "
+        f"num_layers={best_config['num_layers']}, "
+        f"dropout={best_config['dropout']}"
+    )
+    final_result = run_training_job(
+        args,
+        data_bundle,
+        save_dir=args.save_dir,
+        hidden_dim=best_config["hidden_dim"],
+        num_layers=best_config["num_layers"],
+        dropout=best_config["dropout"],
+        epochs=args.epochs,
+        patience=args.patience,
+        resume_from=None,
+        export_best_onnx=True,
+        create_plots=True,
+        save_epoch_checkpoints=True,
+        seed=42,
+        run_label="best_search_model",
+    )
+
+    final_summary = {
+        "search": best_config,
+        "final_train": final_result,
+    }
+    final_summary_path = os.path.join(args.save_dir, "architecture_search_summary.json")
+    with open(final_summary_path, "w", encoding="ascii") as handle:
+        json.dump(final_summary, handle, indent=2)
+    print(f"Saved final summary -> {final_summary_path}")
+    return final_result
+
 
 def run_diagnostics(args):
     set_seed(42)
@@ -1013,24 +1370,42 @@ def parse_args():
                         help="Path to geometry_clean.csv")
     shared.add_argument("--max_events", type=int, default=None,
                         help="Max events per class (None = all)")
-    shared.add_argument("--charge_threshold", type=float, default=1.0,
+    shared.add_argument("--charge_threshold", type=float, default=0.0,
                         help="Keep only DOM hits with charge > threshold")
     shared.add_argument("--save_dir",   default="./output",
                         help="Directory to save outputs")
 
     # Train
-    train_p = subparsers.add_parser("train", parents=[shared],
-                                     help="Train the GNN")
-    train_p.add_argument("--epochs",     type=int,   default=100)
-    train_p.add_argument("--batch_size", type=int,   default=32)
-    train_p.add_argument("--lr",         type=float, default=1e-3,
-                         help="Peak learning rate (after warmup)")
-    train_p.add_argument("--val_frac",   type=float, default=0.15)
-    train_p.add_argument("--test_frac",  type=float, default=0.15)
-    train_p.add_argument("--patience",   type=int,   default=15,
-                         help="Early stopping patience (epochs without AUC gain)")
-    train_p.add_argument("--resume_from", type=str, default=None,
-                         help="Path to checkpoint to resume training from")
+
+    train_p = subparsers.add_parser("train", parents=[shared], help="Train the GNN")
+    train_p.add_argument("--epochs", type=int, default=100)
+    train_p.add_argument("--batch_size", type=int, default=32, help="Batch size (try 16, 32, 64)")
+    train_p.add_argument("--lr", type=float, default=1e-3, help="Peak learning rate (try 1e-3, 5e-4, 1e-4)")
+    train_p.add_argument("--val_frac", type=float, default=0.15)
+    train_p.add_argument("--test_frac", type=float, default=0.15)
+    train_p.add_argument("--patience", type=int, default=15, help="Early stopping patience (try 15, 25, 40)")
+    train_p.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint to resume training from")
+    train_p.add_argument("--hidden_dim", type=int, default=256, help="Hidden dimension size (try 128, 192, 256, 384)")
+    train_p.add_argument("--num_layers", type=int, default=7, help="Number of GNN layers (try 5, 7, 9)")
+    train_p.add_argument("--dropout", type=float, default=0.4, help="Dropout rate (try 0.3, 0.4, 0.5)")
+    train_p.add_argument("--weight_decay", type=float, default=1e-3, help="Weight decay for AdamW (try 1e-3, 5e-4, 1e-4)")
+
+    search_p = subparsers.add_parser("search", parents=[shared], help="Search multiple GNN architectures and retrain the best")
+    search_p.add_argument("--epochs", type=int, default=100, help="Full training epochs for the winning architecture")
+    search_p.add_argument("--batch_size", type=int, default=32, help="Batch size used for search and final retraining")
+    search_p.add_argument("--lr", type=float, default=1e-3, help="Peak learning rate")
+    search_p.add_argument("--val_frac", type=float, default=0.15)
+    search_p.add_argument("--test_frac", type=float, default=0.15)
+    search_p.add_argument("--patience", type=int, default=15, help="Early stopping patience for final retraining")
+    search_p.add_argument("--hidden_dim", type=int, default=256, help="Unused in search mode; final value is selected from the search space")
+    search_p.add_argument("--num_layers", type=int, default=7, help="Unused in search mode; final value is selected from the search space")
+    search_p.add_argument("--dropout", type=float, default=0.4, help="Unused in search mode; final value is selected from the search space")
+    search_p.add_argument("--weight_decay", type=float, default=1e-3, help="Weight decay for AdamW")
+    search_p.add_argument("--search_epochs", type=int, default=20, help="Epochs to use for each architecture trial")
+    search_p.add_argument("--search_patience", type=int, default=8, help="Early stopping patience for each architecture trial")
+    search_p.add_argument("--search_hidden_dims", nargs="+", type=int, default=[128, 256, 384], help="Hidden dimensions to try during search")
+    search_p.add_argument("--search_num_layers", nargs="+", type=int, default=[5, 7, 9], help="Layer counts to try during search")
+    search_p.add_argument("--search_dropouts", nargs="+", type=float, default=[0.3, 0.4, 0.5], help="Dropout values to try during search")
 
     # Transformer sequence model
     tr_p = subparsers.add_parser("train_transformer", parents=[shared],
@@ -1052,6 +1427,18 @@ def parse_args():
     tr_p.add_argument("--dropout",          type=float, default=0.2)
     tr_p.add_argument("--time_window_ns",   type=float, default=1500.0,
                       help="Time window [t0, t0+window] used to build hit sequences")
+
+    # Export ONNX
+    export_p = subparsers.add_parser("export_onnx",
+                                     help="Export a trained .pt model to ONNX")
+    export_p.add_argument("--weights", required=True,
+                          help="Path to a saved model .pt file or checkpoint")
+    export_p.add_argument("--onnx_out", default=None,
+                          help="Output ONNX path (defaults to weights path with .onnx extension)")
+    export_p.add_argument("--num_nodes", type=int, default=16,
+                          help="Dummy node count used to trace the graph during export")
+    export_p.add_argument("--opset", type=int, default=17,
+                          help="ONNX opset version to use for export")
 
     # Diagnostics
     diag_p = subparsers.add_parser("diagnostics", parents=[shared],
@@ -1078,6 +1465,10 @@ if __name__ == "__main__":
 
     if args.mode == "train":
         train(args)
+    elif args.mode == "search":
+        search_architectures(args)
+    elif args.mode == "export_onnx":
+        export_onnx(args)
     elif args.mode == "diagnostics":
         run_diagnostics(args)
     elif args.mode == "plot_features":
