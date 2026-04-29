@@ -628,7 +628,7 @@ def create_dataloaders(data_bundle, batch_size):
 def save_training_plots(save_dir, train_losses, val_losses, val_aucs,
                         lr_history, best_val_auc, best_epoch,
                         test_auc, test_preds, test_trues):
-    fig, axes = plt.subplots(1, 4, figsize=(20, 4), facecolor="black")
+    fig, axes = plt.subplots(1, 5, figsize=(25, 4), facecolor="black")
     fig.patch.set_facecolor("black")
 
     def style(ax, title, xlabel, ylabel):
@@ -664,6 +664,31 @@ def save_training_plots(save_dir, train_losses, val_losses, val_aucs,
     axes[3].plot([0, 1], [0, 1], color="gray", lw=1, linestyle="--")
     axes[3].legend(facecolor="black", labelcolor="white", edgecolor="gray")
     style(axes[3], "ROC -- Test Set", "FPR", "TPR")
+
+    sig_mask = test_trues >= 0.5
+    bkg_mask = test_trues < 0.5
+    bins = np.linspace(0.0, 1.0, 51)
+    if np.any(sig_mask):
+        axes[4].hist(
+            test_preds[sig_mask],
+            bins=bins,
+            density=True,
+            alpha=0.6,
+            color="cyan",
+            label="nutau (sig)",
+        )
+    if np.any(bkg_mask):
+        axes[4].hist(
+            test_preds[bkg_mask],
+            bins=bins,
+            density=True,
+            alpha=0.6,
+            color="orange",
+            label="nue (bkg)",
+        )
+    axes[4].set_xlim(0.0, 1.0)
+    axes[4].legend(facecolor="black", labelcolor="white", edgecolor="gray")
+    style(axes[4], "Score Distribution", "Predicted score", "Density")
 
     plt.tight_layout()
     plot_path = os.path.join(save_dir, "training_curves.png")
@@ -1439,6 +1464,12 @@ def parse_args():
                           help="Dummy node count used to trace the graph during export")
     export_p.add_argument("--opset", type=int, default=17,
                           help="ONNX opset version to use for export")
+    export_p.add_argument("--hidden_dim", type=int, default=None,
+                          help="Hidden dimension size (overrides checkpoint/config)")
+    export_p.add_argument("--num_layers", type=int, default=None,
+                          help="Number of GNN layers (overrides checkpoint/config)")
+    export_p.add_argument("--dropout", type=float, default=None,
+                          help="Dropout rate (overrides checkpoint/config)")
 
     # Diagnostics
     diag_p = subparsers.add_parser("diagnostics", parents=[shared],
